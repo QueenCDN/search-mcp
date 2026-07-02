@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "search-mcp": {
+      "command": "/Users/YOUR_USERNAME/search-mcp/.venv/bin/python",
+      "args": [
+        "/Users/YOUR_USERNAME/search-mcp/server.py"
+      ],
+      "env": {
+        "SEARCH_MAX_RESULTS": "5",
+        "SEARCH_MAX_PAGES": "5",
+        "NEWS_MAX_RESULTS": "5",
+        "PAGE_TIMEOUT": "8",
+        "MAX_CHARS_PER_PAGE": "4000",
+        "MAX_TOTAL_CHARS": "20000",
+        "CACHE_TTL_SECONDS": "300",
+        "LOG_LEVEL": "INFO"
+      },
+      "type": "stdio"
+    }
+  }
+}
