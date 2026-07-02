@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(/c/Users/lubov/AppData/Local/Temp/claude/C--Users-lubov-Desktop-search-mcp/38df4df1-2a79-4e19-91ec-747898b59a3f/scratchpad/verify_venv/Scripts/python -c ' *)"
-    ]
-  }
-}
