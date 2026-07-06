@@ -1,131 +1,143 @@
 # search-mcp
 
-A lightweight, production-grade [MCP](https://modelcontextprotocol.io) server that gives
-[AnythingLLM](https://anythingllm.com) (or any MCP client) real internet access via DuckDuckGo
-search + full-page content extraction, without relying on AnythingLLM's built-in web browsing
-pipeline.
+A production-grade [MCP](https://modelcontextprotocol.io) server that gives
+[AnythingLLM](https://anythingllm.com) (or any MCP client) real internet access — web search,
+news, page reading, weather, currency rates, Wikipedia — plus offline utilities (time, unit
+conversion, calculator, random data). No API keys, no paid services.
 
-Built for a resource-constrained host (Intel iMac, 8 GB RAM): no API keys, no paid services,
-a small dependency footprint, bounded concurrency, and hard caps on how much text is ever sent
-back to the model.
+Built for a resource-constrained host (Intel iMac, 8 GB RAM): small dependency footprint,
+bounded concurrency, hard caps on memory and on how much text is ever sent back to the model.
 
 ```
-User -> AnythingLLM -> Gemma 3 4B (Ollama) -> search-mcp (this project) -> DuckDuckGo + live web pages
+User -> AnythingLLM -> Gemma 3 4B (Ollama) -> search-mcp (this project) -> internet
 ```
 
-## What it does
+## Why not the built-in search / duckduckgo-search?
 
-Exposes exactly three MCP tools:
+The `duckduckgo-search` PyPI package hardcodes scraping backends that get blocked, which is
+where the persistent `403 Ratelimit` errors come from. This project talks to the search
+backends directly and defensively:
 
-| Tool          | Purpose                                                              |
-|---------------|-----------------------------------------------------------------------|
-| `search_web`  | General web search: DuckDuckGo query -> top results -> download pages -> cleaned text |
-| `search_news` | News-focused search, capped at 5 results, falls back to the article snippet if a page can't be scraped |
-| `fetch_page`  | Read one specific URL and return only its cleaned, readable content |
+- **Cascading providers** — web: DuckDuckGo HTML → DuckDuckGo Lite → Bing Web RSS;
+  news: Bing News RSS → Google News RSS → web cascade. One blocked backend never
+  breaks a search.
+- **Per-provider rate limiting** — a polite minimum interval between requests to the same
+  backend (default 2s), with jitter.
+- **Circuit breaker** — a backend that returns 403/429 is taken out of rotation with an
+  exponentially growing cooldown (up to 15 min) instead of being hammered while blocked.
+- **Retries with exponential backoff** on empty cascades, plus request-level retries for
+  transient 5xx from the free APIs.
+- **Smart caching** (LRU + TTL + memory cap) so repeated questions don't hit the network
+  at all, and identical concurrent queries are computed once.
 
-Every tool:
+## The 12 tools
 
-- Downloads pages concurrently (small thread pool) with an 8 second per-page timeout.
-- Extracts readable content with `trafilatura` first, falling back to a `BeautifulSoup4`
-  strip-and-scrape pass if trafilatura can't get a clean result.
-- Strips navigation, headers, footers, ads, cookie banners, and menu boilerplate.
-- Skips any page that times out, 404s, gets blocked (403/429/Cloudflare-style challenges), or
-  isn't HTML — without ever failing the whole request because of one bad page.
-- Caps output at 4,000 characters per page and 20,000 characters combined, so Gemma 3 4B never
-  receives an oversized context.
-- Caches identical queries/URLs in memory for 5 minutes.
-- Logs every stage (search start/finish, pages downloaded/skipped, cache hits, errors) to stderr.
+| Tool | What it does |
+|---|---|
+| `search_web(query)` | Cascading web search; downloads the top pages, strips boilerplate, returns readable text. Language/region are auto-detected from the query; authoritative sources (Reuters, AP, BBC, TechCrunch, Wikipedia, docs…) rank first; junk/social domains are filtered out. |
+| `search_news(query)` | News-index search (Bing News / Google News), max 5 results, with dates and source names; falls back to snippets for paywalled sites. |
+| `fetch_page(url)` | Reads one URL and returns only the cleaned article text. |
+| `current_time(location="")` | Time, date, weekday (EN+RU), timezone, UTC offset for a city/country ("Moscow", "Стамбул") or IANA zone. |
+| `current_date(location="")` | Date, weekday, month, ISO week number, day of year. |
+| `weather(location)` | Current conditions + 3-day forecast via free Open-Meteo: temperature, feels-like, humidity, wind, precipitation probability. |
+| `currency_rate(from, to, amount=1)` | Exchange rates via open.er-api.com with frankfurter.app (ECB) fallback. Accepts ISO codes, symbols, and names: `USD`, `$`, `доллар`, `₺`. Supports RUB, TRY, and ~160 others. |
+| `wikipedia_search(query, language="")` | Article summary + link; the Wikipedia language edition follows the query language automatically. |
+| `unit_converter(value, from_unit, to_unit)` | Mass, length, temperature, volume, area, speed, data, time. English and Russian unit names (`kg`/`кг`, `мили`, `галлоны`). |
+| `calculator(expression)` | Safe math: arithmetic, `%` percentages, `^` powers, roots, trigonometry, logarithms, factorials, constants `pi`/`e`. AST-sandboxed — no code execution possible. |
+| `generate_uuid(count=1)` | 1–50 random UUIDv4 values. |
+| `random_generator(kind, ...)` | Random integers/floats in a range, strings, secure passwords, coin flips, dice (`2d6`), or a choice from a list. |
 
 ## Project layout
 
 ```
 search-mcp/
-├── server.py                    # FastMCP server: defines the 3 MCP tools
-├── search.py                    # DuckDuckGo querying, concurrent scraping, caching, formatting
-├── scraper.py                   # HTTP fetch + trafilatura/BeautifulSoup extraction
-├── utils.py                     # Config loading, logging, TTL cache, text cleanup
-├── requirements.txt
-├── .env                         # Tunable limits (see below)
-├── anythingllm_mcp_servers.json # Example AnythingLLM MCP registration
-└── README.md
+├── server.py            # FastMCP server: registers the 12 tools, stats, error guard
+├── search.py            # Search orchestration: cascade -> scrape -> format, caching
+├── providers.py         # Search backends, ranking, trusted/blocked domain lists
+├── scraper.py           # Page download + trafilatura/BS4 extraction
+├── net.py               # Pooled HTTP session, rate limiter, circuit breaker
+├── cache.py             # LRU+TTL cache with memory bound and in-flight dedup
+├── local_tools.py       # time/date/converter/calculator/uuid/random (offline)
+├── external_tools.py    # weather/currency/wikipedia (free APIs)
+├── utils.py             # config, colored logging, stats, language detection
+├── tests/               # pytest suite (152 offline tests + 9 live tests)
+├── requirements.txt     # runtime dependencies
+├── requirements-dev.txt # + pytest
+├── .env                 # tunable limits (see below)
+└── anythingllm_mcp_servers.json  # example AnythingLLM registration
 ```
 
 ## Requirements
 
-- Python 3.11+ (tested with 3.11–3.14)
-- macOS Monterey 12 (or any OS — nothing here is macOS-specific)
-- No API keys, no paid accounts
+- Python 3.11+ (3.12 recommended; tested on 3.12–3.14)
+- macOS / Linux / Windows — nothing platform-specific
+- No API keys, no accounts
 
 ## Installation
 
 ```bash
 cd ~/search-mcp
 
-# create and activate a virtual environment
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-# install dependencies
 pip install -r requirements.txt
 ```
 
-To deactivate the virtual environment later: `deactivate`.
-
 ## Configuration
 
-All limits live in `.env` (loaded automatically via `python-dotenv`) and can also be set as
-regular environment variables — environment variables take precedence if both are set.
+Everything lives in `.env` (auto-loaded) and can be overridden by real environment variables,
+including the `env` block of the AnythingLLM config.
 
-| Variable               | Default | Meaning |
-|------------------------|---------|---------|
-| `SEARCH_MAX_RESULTS`   | 5       | Max DuckDuckGo results fetched for `search_web` |
-| `SEARCH_MAX_PAGES`     | 5       | Max pages actually downloaded per web search |
-| `NEWS_MAX_RESULTS`     | 5       | Max results for `search_news` |
-| `PAGE_TIMEOUT`         | 8       | Per-page HTTP timeout, in seconds |
-| `REQUEST_MAX_WORKERS`  | 4       | Thread pool size for concurrent page downloads |
-| `SEARCH_RETRY_ATTEMPTS`| 3       | Retries for a DuckDuckGo query if it transiently returns zero results |
-| `MAX_CHARS_PER_PAGE`   | 4000    | Character cap applied to each individual page |
-| `MAX_TOTAL_CHARS`      | 20000   | Character cap applied to the combined tool output |
-| `CACHE_TTL_SECONDS`    | 300     | In-memory cache lifetime for identical queries/URLs |
-| `USER_AGENT`           | (desktop Chrome/macOS UA) | Sent on every outbound HTTP request |
-| `LOG_LEVEL`            | INFO    | Python logging level (`DEBUG`, `INFO`, `WARNING`, ...) |
+| Variable | Default | Meaning |
+|---|---|---|
+| `SEARCH_MAX_RESULTS` | 5 | Max results per web search |
+| `SEARCH_MAX_PAGES` | 5 | Max pages downloaded per search |
+| `NEWS_MAX_RESULTS` | 5 | Max news results |
+| `SEARCH_RETRY_ATTEMPTS` | 2 | Full-cascade retry passes (exponential backoff) |
+| `SEARCH_REGION` | auto | `auto` = derive from query language; or pin `ru-ru`, `us-en`, `de-de`… |
+| `PAGE_TIMEOUT` | 8 | Per-page HTTP timeout, seconds |
+| `REQUEST_MAX_WORKERS` | 4 | Thread pool size for page downloads |
+| `MAX_HTML_BYTES` | 2000000 | Download size cap per page (memory protection) |
+| `PROVIDER_MIN_INTERVAL` | 2.0 | Min seconds between hits to the same search backend |
+| `PROVIDER_COOLDOWN` | 120 | Base circuit-breaker cooldown after a block, doubles per failure |
+| `MAX_CHARS_PER_PAGE` | 4000 | Text cap per page sent to the model |
+| `MAX_TOTAL_CHARS` | 20000 | Combined output cap per tool call |
+| `CACHE_TTL_SECONDS` | 300 | Search result cache lifetime |
+| `CACHE_MAX_ENTRIES` | 256 | Cache entry cap (LRU eviction) |
+| `CACHE_MAX_MEMORY_MB` | 32 | Cache memory cap (LRU eviction) |
+| `PAGE_TTL_SECONDS` | 900 | fetch_page cache lifetime |
+| `WEATHER_TTL_SECONDS` | 600 | Weather cache lifetime |
+| `CURRENCY_TTL_SECONDS` | 3600 | Currency rate cache lifetime |
+| `WIKI_TTL_SECONDS` | 86400 | Wikipedia summary cache lifetime |
+| `DEFAULT_TIMEZONE` | (local) | Timezone used when `current_time()` gets no location |
+| `LOG_LEVEL` | INFO | DEBUG / INFO / WARNING / ERROR |
+| `STATS_LOG_EVERY` | 20 | Log a stats summary every N tool calls (0 = off) |
 
-Edit `.env` directly, or override per-deployment via the `env` block in
-`anythingllm_mcp_servers.json`.
+## Running the server
 
-## Running the server standalone
-
-The server communicates over stdio, which is how AnythingLLM (and every other MCP client) talks
-to it — you don't "browse to" it like a web server.
+The server speaks MCP over stdio — AnythingLLM launches it as a subprocess; you don't
+normally run it by hand:
 
 ```bash
 source .venv/bin/activate
-python server.py
+python server.py        # waits for MCP messages on stdin, logs to stderr
 ```
 
-It will sit waiting for MCP protocol messages on stdin/stdout and log activity to stderr. Use
-`Ctrl+C` to stop it. You generally won't run it this way in production; AnythingLLM launches it
-as a subprocess automatically (see below).
-
-For interactive debugging, FastMCP ships an inspector:
+For interactive debugging, FastMCP ships an inspector UI:
 
 ```bash
 fastmcp dev server.py
 ```
 
-This opens a local web UI where you can call `search_web`, `search_news`, and `fetch_page`
-directly and inspect raw results.
-
 ## Connecting to AnythingLLM
 
-1. Locate AnythingLLM's MCP configuration. In the desktop app this is exposed under
-   **Settings -> Agent Skills / Tools -> MCP Servers** (AnythingLLM writes this to a
-   `plugins/anythingllm_mcp_servers.json` file inside its storage directory). If you're editing
-   the file directly, merge in the contents of the example file in this repo:
-   [`anythingllm_mcp_servers.json`](anythingllm_mcp_servers.json).
+1. Open AnythingLLM → **Settings → Agent Skills → MCP Servers** (the config file is
+   `plugins/anythingllm_mcp_servers.json` inside AnythingLLM's storage directory).
+   Merge in [`anythingllm_mcp_servers.json`](anythingllm_mcp_servers.json) from this repo.
 
-2. Update the `command` and `args` paths to point at **your** virtual environment's Python
-   interpreter and **your** absolute path to `server.py`, for example:
+2. Fix the two paths for your machine — they must point at the **venv's** Python and the
+   absolute path of `server.py`:
 
    ```json
    {
@@ -139,36 +151,33 @@ directly and inspect raw results.
    }
    ```
 
-   Always use the venv's interpreter (`.venv/bin/python`), not a bare `python3` — otherwise the
-   subprocess AnythingLLM launches won't have `fastmcp`, `trafilatura`, etc. installed.
+3. Restart AnythingLLM (or reload MCP servers in its UI). All 12 tools should appear.
 
-3. Restart AnythingLLM (or reload MCP servers from its settings UI). The three tools
-   (`search_web`, `search_news`, `fetch_page`) should appear as available tools for the workspace
-   / agent.
+4. In the workspace's agent settings, enable the `search-mcp` tools and disable the built-in
+   web browsing skill so the model uses this server instead.
 
-4. In your workspace's agent configuration, enable the `search-mcp` tools and disable
-   AnythingLLM's built-in web search/browsing skill so Gemma calls this server instead.
+5. Ask something that needs the internet — e.g. *"Какая сейчас погода в Москве?"* or
+   *"OpenAI latest news"* — and watch the agent call the tools in the trace.
 
-5. Ask Gemma something that requires current information, e.g. *"What's the latest version of
-   Ollama and what changed?"* — it should invoke `search_web` (visible in AnythingLLM's agent
-   trace) and answer from the returned page content.
-
-## Testing examples
-
-### Quick sanity check without AnythingLLM
-
-With the virtual environment active:
+## Testing
 
 ```bash
-python -c "from search import search_web; print(search_web('capital of France'))"
-python -c "from search import search_news; print(search_news('local AI models'))"
-python -c "from search import fetch_single_page; print(fetch_single_page('https://en.wikipedia.org/wiki/Ollama'))"
+pip install -r requirements-dev.txt
+
+pytest              # 152 offline tests: cache, ranking, parsing, tools, MCP protocol
+pytest -m live -v   # 9 live tests against real services (network required)
 ```
 
-### Exercising the real MCP protocol path
+Quick manual checks without AnythingLLM:
 
-This calls the tools exactly the way AnythingLLM would, over FastMCP's client, without needing a
-full AnythingLLM install:
+```bash
+python -c "from search import search_web; print(search_web('OpenAI latest news'))"
+python -c "from external_tools import weather; print(weather('Москва'))"
+python -c "from external_tools import currency_rate; print(currency_rate('USD','RUB',100))"
+python -c "from local_tools import calculator; print(calculator('2^10 + 15% * 200'))"
+```
+
+Or through the real MCP protocol:
 
 ```bash
 python - <<'PY'
@@ -178,49 +187,29 @@ import server
 
 async def main():
     async with Client(server.mcp) as client:
-        result = await client.call_tool("search_web", {"query": "latest Ollama release notes"})
-        print(result.content[0].text)
+        r = await client.call_tool("search_web", {"query": "latest Ollama release"})
+        print(r.content[0].text)
 
 asyncio.run(main())
 PY
 ```
 
-### Checking logs
+## Reliability & performance notes
 
-Run the server directly and watch stderr for structured log lines:
-
-```bash
-python server.py
-```
-
-```
-2026-07-02 04:18:07 | INFO | search_mcp.search  | Search started: web query='latest Ollama release'
-2026-07-02 04:18:09 | WARNING | search_mcp.scraper | Fetch blocked for https://example.com/... (HTTP 403) - likely bot protection, skipping
-2026-07-02 04:18:09 | INFO | search_mcp.search  | Pages downloaded: 4, pages skipped: 1
-2026-07-02 04:18:09 | INFO | search_mcp.search  | Search finished: web query='latest Ollama release' in 2.31s
-```
-
-## Performance notes (why this stays lightweight on an 8 GB iMac)
-
-- Page downloads use a small `ThreadPoolExecutor` (default 4 workers) — cheap for I/O-bound HTTP
-  requests, without spinning up async infrastructure or extra processes.
-- Nothing is held in memory beyond the in-process TTL cache, which only stores already-truncated,
-  cleaned text (never raw HTML).
-- `trafilatura` and `lxml` are the only "heavy" dependencies; both are pure/compiled libraries
-  with modest memory footprints — there is no headless browser, no Selenium, no Playwright.
-- Hard character caps (`MAX_CHARS_PER_PAGE`, `MAX_TOTAL_CHARS`) bound both memory use and the size
-  of the context handed to Gemma 3 4B, which matters for both RAM and inference latency on this
-  hardware.
+- **No crash policy**: every tool is wrapped in a guard that converts any exception into a
+  readable message; scraping failures degrade to search snippets; missing providers degrade
+  to the next one in the cascade. The server process itself never dies from a bad page.
+- **Memory**: pages are streamed and cut at `MAX_HTML_BYTES`; the cache is capped by entries
+  *and* bytes; one long-lived thread pool (4 workers) handles downloads; no headless browser.
+- **Connections**: a single pooled `requests.Session` reuses TCP/TLS connections across all
+  requests.
+- **Observability**: colored structured logs (timings per tool call, pages downloaded/skipped,
+  cache hits, provider cooldowns) plus a periodic stats summary with process memory.
 
 ## Known limitations
 
-- DuckDuckGo's underlying scraping backends (used internally by the `duckduckgo-search` package)
-  are occasionally rate-limited and can return zero results for a well-formed query; `search_web`
-  and `search_news` retry up to `SEARCH_RETRY_ATTEMPTS` times before giving up and returning a
-  "no results" message rather than an error.
-- Some sites (Cloudflare-protected pages, paywalled news sites) will always be skipped — this is
-  by design (`Never stop because of one failed request`), not a bug. `search_news` falls back to
-  the DuckDuckGo snippet text for any article it can't scrape.
-- The `duckduckgo-search` package on PyPI has announced a rename to `ddgs`; if a future version
-  removes the `duckduckgo_search` import path, update the `import` in `search.py` and the entry
-  in `requirements.txt` accordingly — no other code changes are needed.
+- Some sites (hard paywalls, Cloudflare-protected pages) can never be scraped; they are
+  detected and replaced with their search snippet rather than failing the request.
+- Google News article links are opaque redirects; those results contribute headline, source,
+  and date (not full text) — the Bing News provider, which gives direct URLs, runs first.
+- Free rate APIs update roughly daily; don't use `currency_rate` for trading decisions.

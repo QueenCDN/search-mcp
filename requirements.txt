@@ -1,7 +1,7 @@
-fastmcp>=3.4.2
-duckduckgo-search>=8.1
+fastmcp>=3.4
 trafilatura>=1.12
 requests>=2.32
 beautifulsoup4>=4.12
 lxml>=5.2
 python-dotenv>=1.0
+tzdata>=2024.1

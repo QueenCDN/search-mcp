@@ -9,10 +9,12 @@
         "SEARCH_MAX_RESULTS": "5",
         "SEARCH_MAX_PAGES": "5",
         "NEWS_MAX_RESULTS": "5",
+        "SEARCH_REGION": "auto",
         "PAGE_TIMEOUT": "8",
         "MAX_CHARS_PER_PAGE": "4000",
         "MAX_TOTAL_CHARS": "20000",
-        "CACHE_TTL_SECONDS": "300",
+        "CACHE_MAX_MEMORY_MB": "32",
+        "DEFAULT_TIMEZONE": "",
         "LOG_LEVEL": "INFO"
       },
       "type": "stdio"

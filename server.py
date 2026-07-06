@@ -1,24 +1,30 @@
-"""MCP server entry point exposing web search tools for AnythingLLM.
+"""MCP server entry point: web search + utility tools for AnythingLLM.
 
-Exposes exactly three tools over the Model Context Protocol using FastMCP:
+Exposes twelve tools over the Model Context Protocol using FastMCP:
 
-* ``search_web``   - general web search with page content extraction.
-* ``search_news``  - news-focused search with page content extraction.
-* ``fetch_page``   - fetch and clean a single URL.
+Web:      search_web, search_news, fetch_page
+Info:     current_time, current_date, weather, currency_rate,
+          wikipedia_search
+Utility:  unit_converter, calculator, generate_uuid, random_generator
 
-Each tool delegates to ``search.py`` for orchestration, which in turn uses
-``scraper.py`` for downloading/extraction and ``utils.py`` for shared
-config, logging, caching, and text cleanup. Tool wrappers here catch all
-exceptions so a single unexpected failure never takes down the MCP server
-process AnythingLLM is talking to.
+Every tool goes through :func:`_guarded`, which records timing/statistics
+and converts any unexpected exception into a readable error string, so a
+single failure can never crash the server process AnythingLLM talks to.
 """
 
 from __future__ import annotations
 
+import functools
+import time
+from typing import Callable
+
 from fastmcp import FastMCP
 
-from search import fetch_single_page, search_news as run_news_search, search_web as run_web_search
-from utils import get_logger, setup_logging
+import external_tools
+import local_tools
+import search as search_module
+from cache import cache
+from utils import STATS, get_logger, setup_logging
 
 setup_logging()
 logger = get_logger("server")
@@ -26,82 +32,280 @@ logger = get_logger("server")
 mcp = FastMCP(
     name="search-mcp",
     instructions=(
-        "Provides live internet access via DuckDuckGo search and web page "
-        "reading. Use search_web for general queries, search_news for "
-        "current-events queries, and fetch_page to read one known URL in "
-        "full. All tools return cleaned, readable plain text."
+        "Provides live internet access (DuckDuckGo/Bing search, news, web "
+        "page reading, weather, currency rates, Wikipedia) plus offline "
+        "utilities (time, date, unit conversion, calculator, UUID and "
+        "random generators). All tools return plain readable text."
     ),
 )
 
 
+def _guarded(fn: Callable[..., str]) -> Callable[..., str]:
+    """Wrap a tool: measure timing, collect stats, never raise."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs) -> str:
+        started = time.monotonic()
+        error = False
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - tool boundary must never raise
+            error = True
+            logger.exception("%s crashed (args=%r, kwargs=%r)", fn.__name__, args, kwargs)
+            return f"{fn.__name__} encountered an unexpected error: {exc}"
+        finally:
+            elapsed = time.monotonic() - started
+            STATS.record_call(fn.__name__, elapsed, error=error)
+            logger.info("tool=%s elapsed=%.2fs%s", fn.__name__, elapsed,
+                        " (error)" if error else "")
+
+    return wrapper
+
+
+# --------------------------------------------------------------------------
+# Web tools
+# --------------------------------------------------------------------------
+
 @mcp.tool
+@_guarded
 def search_web(query: str) -> str:
-    """Search the web for a query and return cleaned content from top results.
+    """Search the web and return cleaned content from the top results.
 
-    Runs a DuckDuckGo search, downloads up to 5 of the top results, strips
-    navigation/ads/boilerplate from each page, and returns the combined
-    readable text. Use this for general knowledge, how-to, or factual
-    questions that require current information from the internet.
+    Runs a cascading search (DuckDuckGo with Bing fallback), downloads up
+    to 5 of the best-ranked pages, strips navigation/ads/boilerplate, and
+    returns the combined readable text. The search region and language
+    are picked automatically from the query language; authoritative
+    sources are ranked first. Use for general knowledge, how-to, and
+    factual questions that need current information.
 
     Args:
-        query: The search query in natural language.
+        query: The search query in natural language (any language).
 
     Returns:
-        Cleaned, readable text combined from the top search results, or a
-        short message explaining why no content was available.
+        Combined readable text of the top results with titles and URLs,
+        or a short message if nothing could be retrieved.
     """
-    try:
-        return run_web_search(query)
-    except Exception as exc:  # noqa: BLE001 - tool boundary must never raise
-        logger.exception("search_web crashed for query=%r", query)
-        return f"search_web encountered an unexpected error: {exc}"
+    return search_module.search_web(query)
 
 
 @mcp.tool
+@_guarded
 def search_news(query: str) -> str:
-    """Search for recent news articles and return cleaned article content.
+    """Search recent news and return cleaned article content.
 
-    Runs a DuckDuckGo news search limited to 5 results, downloads each
-    article, strips boilerplate, and returns the combined readable text.
-    Use this specifically for current-events or "latest news about X"
-    style questions.
+    Uses dedicated news indexes (Bing News, Google News) limited to 5
+    results, prefers authoritative outlets, downloads readable article
+    text where possible, and falls back to headline + snippet for
+    paywalled sources. Use for current events and "latest news about X"
+    questions.
 
     Args:
-        query: The news search query in natural language.
+        query: The news topic in natural language (any language).
 
     Returns:
-        Cleaned, readable text combined from the top news results, or a
-        short message explaining why no content was available.
+        Combined readable news content with dates, sources, and URLs,
+        or a short message if nothing could be retrieved.
     """
-    try:
-        return run_news_search(query)
-    except Exception as exc:  # noqa: BLE001 - tool boundary must never raise
-        logger.exception("search_news crashed for query=%r", query)
-        return f"search_news encountered an unexpected error: {exc}"
+    return search_module.search_news(query)
 
 
 @mcp.tool
+@_guarded
 def fetch_page(url: str) -> str:
-    """Fetch a single webpage and return its cleaned readable content.
+    """Fetch one specific webpage and return only its readable content.
 
-    Use this when you already have a specific URL (from a prior search
-    result, or given directly by the user) and need its full readable
-    content rather than a search snippet.
+    Downloads the page (8s timeout, size-capped), removes navigation,
+    ads, cookie banners, and scripts, and returns clean article text.
+    Use when you already know the exact URL to read.
 
     Args:
-        url: The full http(s) URL of the page to read.
+        url: Full http(s) URL of the page.
 
     Returns:
-        Cleaned, readable text extracted from the page, or a short message
-        explaining why the page could not be read.
+        Cleaned readable text, or a short message explaining the failure.
     """
-    try:
-        return fetch_single_page(url)
-    except Exception as exc:  # noqa: BLE001 - tool boundary must never raise
-        logger.exception("fetch_page crashed for url=%r", url)
-        return f"fetch_page encountered an unexpected error: {exc}"
+    return search_module.fetch_single_page(url)
+
+
+# --------------------------------------------------------------------------
+# Info tools
+# --------------------------------------------------------------------------
+
+@mcp.tool
+@_guarded
+def current_time(location: str = "") -> str:
+    """Current time, date, weekday, and timezone for a place.
+
+    Args:
+        location: City, country (English or Russian: "Moscow", "Стамбул",
+            "New York"), or IANA zone ("Europe/Moscow"). Empty = server's
+            local time.
+
+    Returns:
+        Time, date, weekday (EN/RU), timezone name, and UTC offset.
+    """
+    return local_tools.current_time(location)
+
+
+@mcp.tool
+@_guarded
+def current_date(location: str = "") -> str:
+    """Current date with weekday, week number, and day of year.
+
+    Args:
+        location: City, country, or IANA timezone; empty = server's local
+            timezone.
+
+    Returns:
+        Date, weekday (EN/RU), month, ISO week number, day of year.
+    """
+    return local_tools.current_date(location)
+
+
+@mcp.tool
+@_guarded
+def weather(location: str) -> str:
+    """Current weather and a 3-day forecast for a city (free Open-Meteo).
+
+    Args:
+        location: City name in any language ("Moscow", "Стамбул", "Paris").
+
+    Returns:
+        Temperature, feels-like, humidity, wind speed/direction, current
+        conditions, and a 3-day min/max forecast with precipitation
+        probability.
+    """
+    return external_tools.weather(location)
+
+
+@mcp.tool
+@_guarded
+def currency_rate(from_currency: str, to_currency: str, amount: float = 1.0) -> str:
+    """Exchange rate between two currencies with optional amount.
+
+    Args:
+        from_currency: Source currency - ISO code, symbol, or name
+            ("USD", "$", "доллар").
+        to_currency: Target currency ("EUR", "RUB", "лира", "₺").
+        amount: Amount to convert (default 1).
+
+    Returns:
+        Converted amount, the unit rate, data source, and update time.
+    """
+    return external_tools.currency_rate(from_currency, to_currency, amount)
+
+
+@mcp.tool
+@_guarded
+def wikipedia_search(query: str, language: str = "") -> str:
+    """Find a Wikipedia article and return its summary and link.
+
+    Args:
+        query: Topic to look up (any language; the Wikipedia language
+            edition is chosen automatically).
+        language: Optional override, e.g. "en" or "ru".
+
+    Returns:
+        Article title, short description, summary, URL, and other close
+        matches.
+    """
+    return external_tools.wikipedia_search(query, language)
+
+
+# --------------------------------------------------------------------------
+# Utility tools
+# --------------------------------------------------------------------------
+
+@mcp.tool
+@_guarded
+def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
+    """Convert between measurement units.
+
+    Supports mass (kg/lb/oz), length (km/mi/ft), temperature (C/F/K),
+    volume (l/gal), area (m2/acre/ha), speed (km/h / mph / knots), data
+    (MB/GB), and time. Unit names work in English and Russian
+    ("кг", "мили", "литры").
+
+    Args:
+        value: Numeric value to convert.
+        from_unit: Source unit ("kg", "мили", "°F").
+        to_unit: Target unit ("lb", "км", "°C").
+
+    Returns:
+        The conversion result, or the list of supported categories if a
+        unit is unknown.
+    """
+    return local_tools.unit_converter(value, from_unit, to_unit)
+
+
+@mcp.tool
+@_guarded
+def calculator(expression: str) -> str:
+    """Safely evaluate a mathematical expression.
+
+    Supports +, -, *, /, //, ^ or ** (power), N% (percent = N/100),
+    parentheses, sqrt/cbrt, trigonometry (sin, cos, tan, atan2...),
+    logarithms (log, log2, log10), exp, abs, round, floor, ceil,
+    factorial, gcd, mod(a, b), and constants pi, e, tau.
+
+    Args:
+        expression: Math expression, e.g. "2^10 + sqrt(144)" or
+            "15% * 2400".
+
+    Returns:
+        "expression = result", or a clear error message.
+    """
+    return local_tools.calculator(expression)
+
+
+@mcp.tool
+@_guarded
+def generate_uuid(count: int = 1) -> str:
+    """Generate random UUIDv4 identifiers.
+
+    Args:
+        count: How many UUIDs to generate (1-50, default 1).
+
+    Returns:
+        The UUIDs, one per line.
+    """
+    return local_tools.generate_uuid(count)
+
+
+@mcp.tool
+@_guarded
+def random_generator(
+    kind: str = "number",
+    minimum: float = 1,
+    maximum: float = 100,
+    length: int = 12,
+    options: str = "",
+) -> str:
+    """Generate random data of a chosen kind.
+
+    Kinds: "number" (integer in [minimum, maximum]), "float", "string"
+    (alphanumeric of given length), "password" (secure, mixed classes),
+    "coin" (flip), "dice" (options="2d6"), "choice" (pick one of
+    options="red,green,blue").
+
+    Args:
+        kind: One of number, float, string, password, coin, dice, choice.
+        minimum: Lower bound for number/float.
+        maximum: Upper bound for number/float.
+        length: Length for string/password (8-128 for passwords).
+        options: Dice spec ("2d6") or comma-separated choices.
+
+    Returns:
+        The generated value as text.
+    """
+    return local_tools.random_generator(kind, minimum, maximum, length, options)
 
 
 if __name__ == "__main__":
-    logger.info("Starting search-mcp server (stdio transport)")
-    mcp.run()
+    logger.info("Starting search-mcp server (stdio transport), %d tools registered", 12)
+    try:
+        mcp.run()
+    finally:
+        # Log final statistics and free pooled resources on shutdown.
+        STATS.log_summary()
+        cache.clear()

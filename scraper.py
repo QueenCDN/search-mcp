@@ -1,150 +1,108 @@
 """Page downloading and readable-content extraction.
 
-Fetches a URL with ``requests``, then extracts the main readable content
-using ``trafilatura`` as the primary parser and a ``BeautifulSoup4``
-fallback for pages trafilatura cannot handle. Every failure mode (timeout,
-HTTP error, bot-protection challenge, non-HTML content, empty extraction)
-is caught and logged so that one bad page never aborts a whole search.
+Downloads pages through the pooled HTTP layer in :mod:`net` (bounded
+size, connection reuse) and extracts the main readable content using
+``trafilatura`` as the primary parser with a ``BeautifulSoup4`` fallback.
+Every failure mode (timeout, HTTP error, bot challenge, non-HTML content,
+empty extraction) returns ``None`` instead of raising, so one bad page
+never aborts a whole search.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
-import requests
 import trafilatura
 from bs4 import BeautifulSoup
 
-from utils import (
-    DEFAULT_HEADERS,
-    PAGE_TIMEOUT,
-    clean_text,
-    get_logger,
-    is_valid_http_url,
-)
+from net import http_get
+from utils import PAGE_TIMEOUT, clean_text, get_logger, is_valid_http_url
 
 logger = get_logger("scraper")
 
-# Tags that never contain the "readable" content of a page.
+# Tags that never contain the readable content of a page.
 _NOISE_TAGS = (
-    "script",
-    "style",
-    "nav",
-    "header",
-    "footer",
-    "aside",
-    "form",
-    "noscript",
-    "iframe",
-    "svg",
-    "button",
-    "input",
+    "script", "style", "nav", "header", "footer", "aside", "form",
+    "noscript", "iframe", "svg", "button", "input", "select", "dialog",
+    "figure", "video", "audio",
 )
 
-# Class/id fragments commonly used for cookie banners, ads, and menus.
+# Class/id/role fragments used by cookie banners, ads, menus, popups.
 _NOISE_SELECTORS = (
-    "[class*='cookie']",
-    "[id*='cookie']",
-    "[class*='consent']",
-    "[id*='consent']",
-    "[class*='banner']",
-    "[class*='advert']",
-    "[class*='ads']",
-    "[id*='ads']",
-    "[class*='popup']",
-    "[class*='modal']",
-    "[class*='menu']",
-    "[class*='navbar']",
-    "[class*='breadcrumb']",
-    "[class*='sidebar']",
-    "[class*='social']",
-    "[class*='newsletter']",
-    "[class*='subscribe']",
-    "[role='navigation']",
-    "[role='banner']",
-    "[role='dialog']",
+    "[class*='cookie']", "[id*='cookie']",
+    "[class*='consent']", "[id*='consent']", "[class*='gdpr']",
+    "[class*='banner']", "[class*='advert']", "[class*='adsbox']",
+    "[class*='ads-']", "[id*='google_ads']", "[class*='sponsor']",
+    "[class*='popup']", "[class*='modal']", "[class*='overlay']",
+    "[class*='paywall']", "[class*='subscribe']", "[class*='newsletter']",
+    "[class*='menu']", "[class*='navbar']", "[class*='breadcrumb']",
+    "[class*='sidebar']", "[class*='related']", "[class*='recommend']",
+    "[class*='share']", "[class*='social']", "[class*='comment']",
+    "[class*='promo']", "[class*='widget']", "[class*='pagination']",
+    "[role='navigation']", "[role='banner']", "[role='dialog']",
+    "[role='complementary']", "[aria-hidden='true']",
 )
 
+# Specific challenge-page phrases only: generic words like "captcha" appear
+# in ordinary pages' scripts (Wikipedia's config JS, articles about bots)
+# and must not cause false positives.
+_BOT_CHALLENGE_TITLES = (
+    "just a moment", "attention required", "access denied",
+    "are you a robot", "verify you are human", "security check",
+)
 _BOT_CHALLENGE_MARKERS = (
-    "just a moment",
-    "attention required",
-    "cf-browser-verification",
-    "checking your browser",
-    "enable javascript and cookies",
-    "captcha",
+    "cf-browser-verification", "cf_chl_opt", "_cf_chl", "g-recaptcha\"",
+    "checking your browser before accessing",
+    "enable javascript and cookies to continue",
+    "ddos protection by",
 )
 
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
-def fetch_html(url: str, timeout: int = PAGE_TIMEOUT) -> Optional[str]:
-    """Download raw HTML for ``url``. Returns ``None`` on any failure.
 
-    All exceptions are caught here: this function is the boundary between
-    unreliable network I/O and the rest of the pipeline, which assumes a
-    clean ``Optional[str]`` result.
-    """
+def _page_looks_blocked(page: str) -> bool:
+    head = page[:6000].lower()
+    match = _TITLE_RE.search(head)
+    if match and any(phrase in match.group(1) for phrase in _BOT_CHALLENGE_TITLES):
+        return True
+    return any(marker in head for marker in _BOT_CHALLENGE_MARKERS)
+
+
+def fetch_html(url: str, timeout: float = PAGE_TIMEOUT) -> Optional[str]:
+    """Download HTML for ``url``. Returns ``None`` on any failure."""
     if not is_valid_http_url(url):
         logger.warning("Skipping invalid URL: %s", url)
         return None
 
-    try:
-        response = requests.get(
-            url,
-            headers=DEFAULT_HEADERS,
-            timeout=timeout,
-            allow_redirects=True,
-        )
-    except requests.exceptions.Timeout:
-        logger.warning("Timeout after %ss fetching %s", timeout, url)
-        return None
-    except requests.exceptions.SSLError as exc:
-        logger.warning("SSL error fetching %s: %s", url, exc)
-        return None
-    except requests.exceptions.ConnectionError as exc:
-        logger.warning("Connection error fetching %s: %s", url, exc)
-        return None
-    except requests.exceptions.RequestException as exc:
-        logger.warning("Request failed for %s: %s", url, exc)
-        return None
-    except Exception as exc:  # noqa: BLE001 - last-resort network safety net
-        logger.error("Unexpected error fetching %s: %s", url, exc)
+    result = http_get(url, timeout=timeout)
+    if not result.ok:
+        level = logger.info if result.blocked or result.status == 404 else logger.warning
+        level("Fetch failed for %s: %s", url, result.error or f"HTTP {result.status}")
         return None
 
-    if response.status_code in (403, 429, 503):
-        logger.warning(
-            "Fetch blocked for %s (HTTP %s) - likely bot protection, skipping",
-            url,
-            response.status_code,
-        )
-        return None
-    if response.status_code == 404:
-        logger.warning("Page not found (404): %s", url)
-        return None
-    if not response.ok:
-        logger.warning("HTTP error %s for %s", response.status_code, url)
+    content_type = result.content_type.lower()
+    if content_type and "html" not in content_type:
+        if content_type.startswith("text/"):
+            # Plain-text resources are already "readable content".
+            return None if not result.text.strip() else result.text
+        logger.info("Skipping non-HTML content (%s): %s", result.content_type, url)
         return None
 
-    content_type = response.headers.get("Content-Type", "")
-    if "html" not in content_type.lower() and content_type:
-        logger.info("Skipping non-HTML content (%s): %s", content_type, url)
+    if _page_looks_blocked(result.text):
+        logger.info("Bot-protection challenge detected, skipping: %s", url)
         return None
-
-    response.encoding = response.encoding or response.apparent_encoding or "utf-8"
-    html = response.text
-
-    lowered_head = html[:2000].lower()
-    if any(marker in lowered_head for marker in _BOT_CHALLENGE_MARKERS):
-        logger.warning("Bot-protection challenge detected, skipping: %s", url)
-        return None
-
-    return html
+    return result.text
 
 
-def _extract_with_trafilatura(html: str, url: str) -> Optional[str]:
+def _extract_with_trafilatura(page: str, url: str) -> Optional[str]:
     try:
         extracted = trafilatura.extract(
-            html,
+            page,
             url=url,
             include_comments=False,
+            # Tables (infoboxes, spec sheets) extract as noisy pipe rows
+            # that waste the model's small context; prose only.
             include_tables=False,
             favor_precision=True,
             deduplicate=True,
@@ -155,55 +113,63 @@ def _extract_with_trafilatura(html: str, url: str) -> Optional[str]:
         return None
 
 
-def _extract_with_bs4(html: str) -> Optional[str]:
+def _extract_with_bs4(page: str) -> Optional[str]:
     try:
-        soup = BeautifulSoup(html, "lxml")
-
+        soup = BeautifulSoup(page, "lxml")
         for tag_name in _NOISE_TAGS:
             for tag in soup.find_all(tag_name):
                 tag.decompose()
-
         for selector in _NOISE_SELECTORS:
-            for tag in soup.select(selector):
-                tag.decompose()
-
-        main = soup.find("main") or soup.find("article") or soup.body or soup
+            try:
+                for tag in soup.select(selector):
+                    tag.decompose()
+            except Exception:  # noqa: BLE001 - one bad selector must not stop the rest
+                continue
+        main = (
+            soup.find("main")
+            or soup.find("article")
+            or soup.find(attrs={"role": "main"})
+            or soup.body
+            or soup
+        )
         text = main.get_text(separator="\n")
         return text.strip() or None
     except Exception as exc:  # noqa: BLE001 - extraction must never crash the pipeline
-        logger.error("BeautifulSoup extraction failed: %s", exc)
+        logger.warning("BeautifulSoup extraction failed: %s", exc)
         return None
 
 
-def extract_readable_text(html: str, url: str) -> Optional[str]:
-    """Extract clean, readable article text from raw HTML.
+def extract_readable_text(page: str, url: str) -> Optional[str]:
+    """Extract clean readable article text from raw HTML.
 
-    Tries trafilatura first (best quality boilerplate removal); falls back
-    to a BeautifulSoup-based strip-and-scrape if trafilatura returns
-    nothing usable (common on heavily templated or unusual pages).
+    Plain-text input (from text/plain resources) passes straight through
+    cleanup. For HTML, trafilatura runs first (best boilerplate removal);
+    if it fails or returns something suspiciously short, the
+    BeautifulSoup strip-and-scrape fallback is tried and the better of
+    the two results wins.
     """
-    text = _extract_with_trafilatura(html, url)
+    if "<" not in page[:1000]:
+        return clean_text(page) or None
+
+    text = _extract_with_trafilatura(page, url)
     source = "trafilatura"
     if not text or len(text) < 200:
-        fallback_text = _extract_with_bs4(html)
-        if fallback_text and (not text or len(fallback_text) > len(text)):
-            text = fallback_text
-            source = "beautifulsoup"
+        fallback = _extract_with_bs4(page)
+        if fallback and (not text or len(fallback) > len(text)):
+            text, source = fallback, "beautifulsoup"
 
     if not text:
         return None
-
     cleaned = clean_text(text)
     if not cleaned:
         return None
-
     logger.debug("Extracted %d chars from %s via %s", len(cleaned), url, source)
     return cleaned
 
 
-def fetch_and_extract(url: str, timeout: int = PAGE_TIMEOUT) -> Optional[str]:
-    """Fetch ``url`` and return cleaned readable text, or ``None`` on failure."""
-    html = fetch_html(url, timeout=timeout)
-    if html is None:
+def fetch_and_extract(url: str, timeout: float = PAGE_TIMEOUT) -> Optional[str]:
+    """Fetch ``url`` and return cleaned readable text, or ``None``."""
+    page = fetch_html(url, timeout=timeout)
+    if page is None:
         return None
-    return extract_readable_text(html, url)
+    return extract_readable_text(page, url)
